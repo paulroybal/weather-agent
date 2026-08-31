@@ -687,57 +687,22 @@ def mark_triggered(uid):
 
 
 def should_trigger():
-    yahoo_email = os.getenv("YAHOO_EMAIL")
-    yahoo_password = os.getenv("YAHOO_APP_PASSWORD", "").replace(" ", "")
+    calendar_url = os.getenv("GOOGLE_CALENDAR_ICS_URL", "").strip()
+
+    if not calendar_url:
+        raise RuntimeError(
+            "GOOGLE_CALENDAR_ICS_URL is not configured in .env"
+        )
 
     now = datetime.now(TZ)
 
-    url = "https://caldav.calendar.yahoo.com/dav/proybal/Calendar/131/"
-
-    body = """<?xml version="1.0" encoding="utf-8" ?>
-<C:calendar-query xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">
-  <D:prop>
-    <C:calendar-data/>
-  </D:prop>
-  <C:filter>
-    <C:comp-filter name="VCALENDAR">
-      <C:comp-filter name="VEVENT"/>
-    </C:comp-filter>
-  </C:filter>
-</C:calendar-query>"""
-
-    r = SESSION.request(
-        "REPORT",
-        url,
-        auth=(yahoo_email, yahoo_password),
-        headers={
-            "Depth": "1",
-            "Content-Type": "application/xml",
-        },
-        data=body,
-        timeout=15,
-    )
-
+    r = SESSION.get(calendar_url, timeout=15)
     r.raise_for_status()
 
-    text = html.unescape(r.text)
+    cal = Calendar.from_ical(r.content)
 
-    events = re.findall(
-        r"BEGIN:VEVENT(.*?)END:VEVENT",
-        text,
-        re.DOTALL,
-    )
-
-    for event in events:
-        summary_match = re.search(r"^SUMMARY:(.*)$", event, re.MULTILINE)
-        dtstart_match = re.search(r"^DTSTART(?:;[^:]+)?:(.*)$", event, re.MULTILINE)
-        dtend_match = re.search(r"^DTEND(?:;[^:]+)?:(.*)$", event, re.MULTILINE)
-        uid_match = re.search(r"^UID:(.*)$", event, re.MULTILINE)
-
-        if not summary_match or not dtstart_match or not dtend_match:
-            continue
-
-        title = summary_match.group(1).strip().lower()
+    for component in cal.walk("VEVENT"):
+        title = str(component.get("SUMMARY", "")).strip().lower()
 
         if title not in [
             "kanw nm music",
@@ -745,49 +710,95 @@ def should_trigger():
         ]:
             continue
 
-        dtstart_raw = dtstart_match.group(1).strip()
-        dtend_raw = dtend_match.group(1).strip()
+        uid = str(component.get("UID", "")).strip()
 
-        start = parse_date(dtstart_raw)
-        end = parse_date(dtend_raw)
+        dtstart = component.decoded("DTSTART")
+        dtend = component.decoded("DTEND")
 
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=TZ)
+        if not isinstance(dtstart, datetime):
+            continue
+
+        if not isinstance(dtend, datetime):
+            continue
+
+        if dtstart.tzinfo is None:
+            dtstart = dtstart.replace(tzinfo=TZ)
         else:
-            start = start.astimezone(TZ)
+            dtstart = dtstart.astimezone(TZ)
 
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=TZ)
+        if dtend.tzinfo is None:
+            dtend = dtend.replace(tzinfo=TZ)
         else:
-            end = end.astimezone(TZ)
+            dtend = dtend.astimezone(TZ)
 
-        if not (start <= now < end):
-            continue
+        duration = dtend - dtstart
 
-        if now.minute > 5:
-            continue
+        rrule = component.get("RRULE")
 
-        uid = (
-            uid_match.group(1).strip()
-            if uid_match
-            else f"{title}-{dtstart_raw}"
-        )
+        # Recurring event
+        if rrule:
+            rule_text = rrule.to_ical().decode()
 
-        hour_key = now.strftime("%Y-%m-%d-%H")
-        state_key = f"{uid}|{hour_key}"
+            rule = rrulestr(
+                rule_text,
+                dtstart=dtstart,
+            )
 
-        if already_triggered(state_key):
-            continue
+            occurrence = rule.before(now, inc=True)
 
-        mark_triggered(state_key)
+            if occurrence:
+                if occurrence.tzinfo is None:
+                    occurrence = occurrence.replace(tzinfo=TZ)
+                else:
+                    occurrence = occurrence.astimezone(TZ)
 
-        print(f"Matched active event: {title} ({start} - {end})")
+                occurrence_end = occurrence + duration
 
-        return True
+                if not (occurrence <= now < occurrence_end):
+                    continue
+
+                if now.minute > 5:
+                    continue
+
+                hour_key = now.strftime("%Y-%m-%d-%H")
+                state_key = f"{uid}|{hour_key}"
+
+                if already_triggered(state_key):
+                    continue
+
+                mark_triggered(state_key)
+
+                print(
+                    f"Matched recurring Google Calendar event: "
+                    f"{title} ({occurrence} - {occurrence_end})"
+                )
+
+                return True
+
+        # Non-recurring event
+        else:
+            if not (dtstart <= now < dtend):
+                continue
+
+            if now.minute > 5:
+                continue
+
+            hour_key = now.strftime("%Y-%m-%d-%H")
+            state_key = f"{uid}|{hour_key}"
+
+            if already_triggered(state_key):
+                continue
+
+            mark_triggered(state_key)
+
+            print(
+                f"Matched Google Calendar event: "
+                f"{title} ({dtstart} - {dtend})"
+            )
+
+            return True
 
     return False
-
-
 def main():
     parser = argparse.ArgumentParser(description="KANW weather email agent")
     parser.add_argument(
