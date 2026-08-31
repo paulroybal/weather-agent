@@ -68,7 +68,7 @@ METRO_AREAS = {
 }
 
 HEADERS = {
-    "User-Agent": "burquebro-weather-agent, proybal@yahoo.com",
+    "User-Agent": "burquebro-weather-agent, paul@paulroybal.com",
     "Accept": "application/geo+json",
 }
 
@@ -268,7 +268,7 @@ def rewrite_statewide_with_ollama(facts):
     Do not invent weather conditions that are not supported by the data.
     Do not include headings or bullet points.
 
-    Write one concise paragraph, generally 80 to 130 words.
+    Write one concise paragraph, generally on the lower side of 80 to 150 words.
 
     REPRESENTATIVE NEW MEXICO FORECASTS:
     {statewide_data}
