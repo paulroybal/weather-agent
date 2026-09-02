@@ -247,6 +247,8 @@ def rewrite_statewide_with_ollama(facts):
     prompt = f"""
     Do not include an introduction to your report.
     
+    Do not cut off sentences.
+    
     You are writing a generalized statewide New Mexico weather forecast for radio.
 
     Use the National Weather Service information below to create a concise,
@@ -807,7 +809,7 @@ def main():
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Run immediately without checking Yahoo Calendar.",
+        help="Run immediately without checking Calendar.",
     )
     parser.add_argument(
         "--preview",
