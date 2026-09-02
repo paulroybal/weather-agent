@@ -15,7 +15,9 @@ from zoneinfo import ZoneInfo
 from astral import LocationInfo
 from astral.sun import sun
 from dateutil.parser import parse as parse_date
+from dateutil.rrule import rrulestr
 from dotenv import load_dotenv
+from icalendar import Calendar
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -705,6 +707,7 @@ def should_trigger():
         title = str(component.get("SUMMARY", "")).strip().lower()
 
         if title not in [
+            "kANW NM Music",
             "kanw nm music",
             "kanw nm msic",
         ]:
