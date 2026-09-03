@@ -233,22 +233,20 @@ def ask_ollama(prompt):
         "stream": False,
         "options": {
             "temperature": 0.1,
-            "num_predict": 120,
+            "num_predict": 300,
         },
     }
 
     r = SESSION.post(url, json=payload, timeout=120)
     r.raise_for_status()
     return r.json()["response"].strip()
-
 def rewrite_statewide_with_ollama(facts):
     statewide_data = build_statewide_weather_data()
 
     prompt = f"""
     Do not include an introduction to your report.
     
-    Do not cut off sentences.
-    
+      
     You are writing a generalized statewide New Mexico weather forecast for radio.
 
     Use the National Weather Service information below to create a concise,
@@ -258,6 +256,10 @@ def rewrite_statewide_with_ollama(facts):
     overall weather pattern across New Mexico.
 
     Do not confuse highs with low temperatures.
+    
+    Be sure to use complete sentences.
+    
+    
 
     Discuss when relevant and significantly more detailed:
     - temperature differences
@@ -271,9 +273,9 @@ def rewrite_statewide_with_ollama(facts):
     Avoid repeatedly saying "expect", "look for", or "there is a chance".
     Do not invent weather conditions that are not supported by the data.
     Do not include headings or bullet points.
-
-    Write one concise paragraph, generally on the lower side of 80 to 150 words.
-
+    
+    Write one concise paragraph 100 words.
+    Do not include "WEATHER ALERT" section.
     REPRESENTATIVE NEW MEXICO FORECASTS:
     {statewide_data}
     """
@@ -501,8 +503,8 @@ def build_statewide_weather_data():
         "Gallup": (35.5281, -108.7426),
         "Las Vegas": (35.5942, -105.2228),
         "Roswell": (33.3943, -104.5230),
-        "Ruidoso": (33.3317, -105.6730),
-        "Las Cruces": (32.3199, -106.7637),
+        "Taos": (36.4072, -105.5731),
+        "Española": (36.0078, -106.0622),
     }
 
     lines = []
@@ -709,7 +711,6 @@ def should_trigger():
         title = str(component.get("SUMMARY", "")).strip().lower()
 
         if title not in [
-            "kANW NM Music",
             "kanw nm music",
             "kanw nm msic",
         ]:
