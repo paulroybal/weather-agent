@@ -69,6 +69,15 @@ METRO_AREAS = {
     "Heights": (35.1100, -106.5300),
 }
 
+LISTENING_AREA = [
+    "Bernalillo",
+    "Sandoval",
+    "Santa Fe",
+    "Valencia",
+    "Torrance",
+    "San Miguel",
+]
+
 HEADERS = {
     "User-Agent": "burquebro-weather-agent, paul@paulroybal.com",
     "Accept": "application/geo+json",
@@ -124,17 +133,70 @@ def pick_city_period(periods):
 
 def get_nm_alerts():
     try:
-        alerts = get_json("https://api.weather.gov/alerts/active?area=NM")
-        features = alerts.get("features", [])
+        data = get_json(
+            "https://api.weather.gov/alerts/active?area=NM"
+        )
+
+        features = data.get("features", [])
 
         if not features:
             return []
 
-        return [f["properties"]["headline"] for f in features]
+        now = datetime.now(TZ)
 
-    except Exception:
+        alerts = []
+
+        for feature in features:
+            props = feature.get("properties", {})
+
+            headline = props.get("headline", "").strip()
+            area_desc = props.get("areaDesc", "").strip()
+
+            # ---------------------------------
+            # Ignore alerts outside our
+            # listening area
+            # ---------------------------------
+
+            if not any(
+                area.lower() in area_desc.lower()
+                for area in LISTENING_AREA
+            ):
+                continue
+
+            # ---------------------------------
+            # Check expiration/end time
+            # ---------------------------------
+
+            end_text = (
+                props.get("ends")
+                or props.get("expires")
+            )
+
+            if end_text:
+                try:
+                    end_time = parse_date(end_text)
+
+                    if end_time.tzinfo is None:
+                        end_time = end_time.replace(tzinfo=TZ)
+                    else:
+                        end_time = end_time.astimezone(TZ)
+
+                    if end_time <= now:
+                        continue
+
+                except Exception as ex:
+                    print(
+                        f"Could not parse alert expiration: {ex}"
+                    )
+
+            if headline:
+                alerts.append(headline)
+
+        return alerts
+
+    except Exception as ex:
+        print(f"Weather alert error: {ex}")
         return []
-
 
 def clean_afd_text(text):
     text = text or ""
@@ -259,7 +321,22 @@ def rewrite_statewide_with_ollama(facts):
     
     Be sure to use complete sentences.
     
+    Write one short paragraph of approximately 50 to 75 words.
+
+    This forecast will be read live on radio, so prioritize only the
+    most important weather information.
     
+    Focus on:
+    - the dominant statewide weather pattern
+    - the areas most affected
+    - significant hazards
+    - major temperature differences
+    
+    Do not repeat similar weather conditions for multiple regions.
+    Do not list individual city forecasts.
+    Do not include minor details when a broader regional description
+    will communicate the same information.
+    Use short, natural sentences that are easy to read aloud.
 
     Discuss when relevant and significantly more detailed:
     - temperature differences
@@ -358,10 +435,6 @@ def get_statewide_forecast():
                 "See the local forecasts below for additional details."
             )
 
-        alerts = get_nm_alerts()
-
-        if alerts:
-            forecast += "\n\nWeather Alert: " + alerts[0]
 
         return "STATEWIDE FORECAST\n\n" + forecast
 
@@ -456,11 +529,27 @@ def get_city_table():
 def get_closing():
     return random.choice(CLOSINGS)
 
-def build_weather_email(statewide, metro, city_table, sun, closing):
+def build_weather_email(
+    statewide,
+    alerts,
+    metro,
+    city_table,
+    sun,
+    closing
+):
+    alert_section = ""
+
+    if alerts:
+        alert_section = "WEATHER ALERTS\n\n"
+
+        for alert in alerts:
+            alert_section += f"{alert}\n"
+
+        alert_section += "\n"
 
     return f"""{statewide}
 
-{metro}
+{alert_section}{metro}
 
 {city_table}
 
@@ -470,7 +559,6 @@ SUNRISE / SUNSET
 
 {closing}
 """
-
 
 def build_metro_rows_html():
     rows = ""
@@ -565,7 +653,7 @@ def build_statewide_weather_data():
     return "\n".join(lines)
 
 
-def build_weather_email_html(statewide, metro, sun, closing):
+def build_weather_email_html(statewide, alerts, metro, sun, closing):
 
     statewide_html = statewide.replace("STATEWIDE FORECAST", "").strip()
     closing_html = closing.replace("\n", "<br>")
@@ -594,7 +682,27 @@ def build_weather_email_html(statewide, metro, sun, closing):
             metro_html += f"<p><strong>{label}:</strong> {text.strip()}</p>"
         elif not line.startswith("Area") and not line.startswith("-") and not line.startswith("Valley") and not line.startswith("Heights"):
             metro_html += f"<p>{line}</p>"
+    alerts_html = ""
 
+    if alerts:
+        alert_items = ""
+
+        for alert in alerts:
+            alert_items += f"<li style='margin-bottom:6px;'>{alert}</li>"
+
+        alerts_html = f"""
+        <div style="
+            margin:20px 0;
+            padding:15px;
+            background:#fff3cd;
+            border:1px solid #ffe69c;
+        ">
+            <h2 style="margin-top:0;">Weather Alerts</h2>
+            <ul style="margin-bottom:0;">
+                {alert_items}
+            </ul>
+        </div>
+        """
     return f"""
 <!DOCTYPE html>
 <html>
@@ -611,6 +719,8 @@ Automated weather briefing for 89.1 KANW FM
 <h2 style="color:#1f5f99;">Statewide Forecast</h2>
 
 <p>{statewide_html}</p>
+
+{alerts_html}
 
 <h2 style="color:#1f5f99;">Metro Forecast</h2>
 
@@ -792,28 +902,48 @@ def should_trigger():
     return False
 
 def main():
-    parser = argparse.ArgumentParser(description="KANW weather email agent")
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Run immediately without checking Calendar.",
+    parser = argparse.ArgumentParser(
+        description="KANW weather email agent"
     )
+
+    parser.add_argument(
+        "--email",
+        action="store_true",
+        help="Send the weather email regardless of Calendar status.",
+    )
+
     parser.add_argument(
         "--preview",
         action="store_true",
         help="Generate the weather briefing without sending email.",
     )
+
     parser.add_argument(
         "--to",
-        help="Override destination email address(es). Separate multiple addresses with commas.",
+        help=(
+            "Override destination email address(es). "
+            "Separate multiple addresses with commas."
+        ),
     )
+
     args = parser.parse_args()
 
-    if args.force or args.preview:
-        mode = "Preview" if args.preview else "Force"
-        print(f"{mode} mode: skipping Yahoo Calendar trigger.\n")
+    # Preview always generates the report but never sends.
+    if args.preview:
+        print("Preview mode: generating weather without sending.\n")
+        should_send = False
+
+    # --email forces an email without requiring a calendar event.
+    elif args.email:
+        print("Email mode: sending regardless of Calendar status.\n")
+        should_send = True
+
+    # Normal cron execution requires an active NM Music event.
     else:
-        if not should_trigger():
+        should_send = should_trigger()
+
+        if not should_send:
+            print("No active NM Music calendar event.")
             return
 
     statewide = get_statewide_forecast()
@@ -821,9 +951,11 @@ def main():
     city_table = get_city_table()
     sun = get_sunrise_sunset()
     closing = get_closing()
+    alerts = get_nm_alerts()
 
     text_message = build_weather_email(
         statewide,
+        alerts,
         metro,
         city_table,
         sun,
@@ -832,40 +964,48 @@ def main():
 
     html_message = build_weather_email_html(
         statewide,
+        alerts,
         metro,
         sun,
         closing,
     )
 
-    if args.force or args.preview:
+    if args.preview:
         destination = args.to or os.getenv("TO_EMAIL")
+
         print(f"Destination email: {destination}\n")
         print("==== WEATHER EMAIL (TEXT) ====\n")
         print(text_message)
         print("\n==============================\n")
 
-        preview_file = Path(__file__).parent / "tmp" / "weather_preview.html"
+        preview_file = (
+            Path(__file__).parent
+            / "tmp"
+            / "weather_preview.html"
+        )
+
         preview_file.parent.mkdir(exist_ok=True)
 
-        with open(preview_file, "w", encoding="utf-8") as f:
+        with open(
+            preview_file,
+            "w",
+            encoding="utf-8",
+        ) as f:
             f.write(html_message)
 
         print(f"HTML preview written to {preview_file}")
-
-    if args.preview:
         print("Preview complete. Email not sent.")
         return
 
-    send_email(
-        "KANW NM Music Weather",
-        text_message,
-        html_message,
-        args.to,
-    )
+    if should_send:
+        send_email(
+            "KANW NM Music Weather",
+            text_message,
+            html_message,
+            args.to,
+        )
 
-    if args.force:
         print("Weather email sent.")
-
 
 if __name__ == "__main__":
     main()
