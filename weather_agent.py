@@ -273,9 +273,24 @@ def rewrite_statewide_with_ollama(facts):
     Avoid repeatedly saying "expect", "look for", or "there is a chance".
     Do not invent weather conditions that are not supported by the data.
     Do not include headings or bullet points.
+    Never state rainfall amounts unless an amount is explicitly
+    provided in the source information.
     
+    Do not infer overnight low temperatures from daytime forecasts.
+    
+    Be geographically accurate when describing New Mexico regions.
+    
+    Do not describe a weather system, such as high pressure or
+    low pressure, unless it is explicitly mentioned in the
+    National Weather Service information.
+    
+    Prefer regional descriptions over listing individual cities.
     Write one concise paragraph 100 words.
     Do not include "WEATHER ALERT" section.
+    
+    NATIONAL WEATHER SERVICE KEY MESSAGES:
+    {facts}
+    
     REPRESENTATIVE NEW MEXICO FORECASTS:
     {statewide_data}
     """
@@ -346,7 +361,7 @@ def get_statewide_forecast():
         alerts = get_nm_alerts()
 
         if alerts:
-            forecast += " Weather Alert: " + alerts[0]
+            forecast += "\n\nWeather Alert: " + alerts[0]
 
         return "STATEWIDE FORECAST\n\n" + forecast
 
@@ -710,10 +725,7 @@ def should_trigger():
     for component in cal.walk("VEVENT"):
         title = str(component.get("SUMMARY", "")).strip().lower()
 
-        if title not in [
-            "kanw nm music",
-            "kanw nm msic",
-        ]:
+        if "nm music" not in title:
             continue
 
         uid = str(component.get("UID", "")).strip()
@@ -763,9 +775,6 @@ def should_trigger():
                 if not (occurrence <= now < occurrence_end):
                     continue
 
-                if now.minute > 5:
-                    continue
-
                 hour_key = now.strftime("%Y-%m-%d-%H")
                 state_key = f"{uid}|{hour_key}"
 
@@ -780,31 +789,8 @@ def should_trigger():
                 )
 
                 return True
-
-        # Non-recurring event
-        else:
-            if not (dtstart <= now < dtend):
-                continue
-
-            if now.minute > 5:
-                continue
-
-            hour_key = now.strftime("%Y-%m-%d-%H")
-            state_key = f"{uid}|{hour_key}"
-
-            if already_triggered(state_key):
-                continue
-
-            mark_triggered(state_key)
-
-            print(
-                f"Matched Google Calendar event: "
-                f"{title} ({dtstart} - {dtend})"
-            )
-
-            return True
-
     return False
+
 def main():
     parser = argparse.ArgumentParser(description="KANW weather email agent")
     parser.add_argument(
