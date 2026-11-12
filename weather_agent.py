@@ -209,78 +209,93 @@ def clean_afd_text(text):
     return text
 
 
-def get_latest_afd_text():
-    products = get_json("https://api.weather.gov/products/types/AFD/locations/ABQ")
+# Forecast offices covering New Mexico. Some EPZ/MAF discussion also
+# covers Texas; the radio summary must use only New Mexico information.
+AFD_OFFICES = {
+    "ABQ": "northern and central New Mexico",
+    "EPZ": "southern New Mexico",
+    "MAF": "southeastern New Mexico",
+}
 
+
+def get_latest_afd_text(office="ABQ"):
+    """Return the latest full Area Forecast Discussion for an NWS office."""
+    products = get_json(
+        f"https://api.weather.gov/products/types/AFD/locations/{office}"
+    )
     graph = products.get("@graph", [])
     if not graph:
-        raise RuntimeError("No AFD products found")
+        raise RuntimeError(f"No AFD products found for {office}")
 
-    latest_id = graph[0]["id"]
-    product = get_json(f"https://api.weather.gov/products/{latest_id}")
-    text = product.get("productText", "")
+    # The API normally lists newest first; prefer the issuance timestamp if
+    # available so we don't accidentally choose an older discussion.
+    latest = max(graph, key=lambda item: item.get("issuanceTime") or "")
+    product = get_json(f"https://api.weather.gov/products/{latest['id']}")
+    discussion = product.get("productText", "")
+    if not discussion.strip():
+        raise RuntimeError(f"Empty AFD product for {office}")
+    return discussion
 
-    match = re.search(
-        r"\.SYNOPSIS\.\.\.\s*(.*?)(?=\n\.[A-Z]|\n&&|\Z)",
+
+def extract_afd_highlights(text):
+    """Select relevant forecast prose, not aviation/fire sections or headers."""
+    # NWS AFD section headings vary by office and over time.
+    sections = re.split(
+        r"(?m)^\s*\.([A-Z][A-Z0-9 /-]*?)\.{2,}\s*",
         text,
-        re.DOTALL,
     )
+    selected = []
+    for i in range(1, len(sections), 2):
+        name = sections[i].strip().upper()
+        body = sections[i + 1].split("\n&&", 1)[0]
+        if any(tag in name for tag in ("AVIATION", "FIRE WEATHER", "HYDROLOGY")):
+            continue
+        if "KEY MESSAGE" in name:
+            limit = 800
+        elif "SYNOPSIS" in name:
+            limit = 650
+        elif "SHORT TERM" in name or "DISCUSSION" in name:
+            limit = 1100
+        elif "LONG TERM" in name:
+            limit = 650
+        else:
+            continue
+        prose = clean_afd_text(body)
+        if prose:
+            selected.append(f"{name}: {prose[:limit]}")
 
-    if not match:
-        match = re.search(
-            r"\.DISCUSSION\.\.\.\s*(.*?)(?=\n\.[A-Z]|\n&&|\Z)",
+    if not selected:
+        # AFDs sometimes use unmarked 'Key Messages:' instead of .SECTIONS...
+        key = re.search(
+            r"(?ims)^\s*Key Messages?\s*:?\s*(.*?)"
+            r"(?=^\s*\.[A-Z][A-Z0-9 /-]*\.{2,}|^\s*&&|\Z)",
             text,
-            re.DOTALL,
         )
+        if key:
+            selected.append("KEY MESSAGES: " + clean_afd_text(key.group(1))[:1000])
 
-    if match:
-        summary = match.group(1).strip()
-    else:
-        summary = text[:1800].strip()
+    if not selected:
+        # Last resort: strip the product header/footers and supply a brief
+        # excerpt; we don't discard an entire office for formatting changes.
+        body = text.split("\n\n", 1)[-1]
+        body = re.split(r"(?m)^\s*\.AVIATION", body, maxsplit=1)[0]
+        selected.append(clean_afd_text(body)[:1100])
 
-    summary = clean_afd_text(summary)
+    return "\n".join(selected[:4])
 
-    sentences = re.split(r"(?<=[.!?])\s+", summary)
 
-    skip_words = [
-        "aviation",
-        "taf",
-        "zulu",
-        "hrrr",
-        "nam",
-        "gfs",
-        "ecmwf",
-        "pwat",
-        "h5",
-        "h7",
-        "700mb",
-        "500mb",
-        "model",
-        "guidance",
-        "forecast package",
-    ]
-
-    good = []
-
-    for sentence in sentences:
-        s = sentence.strip()
-        low = s.lower()
-
-        if len(s) < 30:
-            continue
-
-        if any(word in low for word in skip_words):
-            continue
-
-        good.append(s)
-
-        if len(good) >= 4:
-            break
-
-    if not good:
-        raise RuntimeError("No usable AFD sentences found")
-
-    return " ".join(good)
+def get_statewide_afd_highlights():
+    """Get independent AFDs; one unavailable office won't break the report."""
+    reports = []
+    for office, region in AFD_OFFICES.items():
+        try:
+            discussion = get_latest_afd_text(office)
+            highlights = extract_afd_highlights(discussion)
+            if highlights.strip():
+                reports.append(f"{office} ({region}):\n{highlights}")
+        except Exception as ex:
+            print(f"AFD retrieval failed for {office}: {ex}")
+    return "\n\n".join(reports)
 
 
 def ask_ollama(prompt):
@@ -288,204 +303,161 @@ def ask_ollama(prompt):
     model = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
 
     url = f"{ollama_url}/api/generate"
-
     payload = {
         "model": model,
         "prompt": prompt,
         "stream": False,
         "options": {
             "temperature": 0.1,
-            "num_predict": 300,
+            "num_predict": 220,
         },
     }
 
     r = SESSION.post(url, json=payload, timeout=120)
     r.raise_for_status()
     return r.json()["response"].strip()
-def rewrite_statewide_with_ollama(facts):
-    statewide_data = build_statewide_weather_data()
 
+
+def rewrite_statewide_with_ollama(afd_highlights, statewide_data):
     prompt = f"""
-    Do not include an introduction to your report.
-    
-      
-    You are writing a generalized statewide New Mexico weather forecast for radio.
+You write a statewide NEW MEXICO weather forecast read aloud on KANW radio.
+Write ONE concise, conversational paragraph of 65 to 80 words, without a title,
+introduction, bullets, or a separate alerts section. Do not exceed 85 words.
+Make it easy to read aloud in about 30 to 40 seconds.
 
-    Use the National Weather Service information below to create a concise,
-    natural-sounding statewide forecast.
+Summarize the most important conditions for today and tonight, including
+tomorrow only when a significant change is forecast. Include regional
+contrasts, precipitation, wind, or hazards only when noteworthy.
+Prioritize what a New Mexico listener would need to know. Use short, clear
+sentences, avoid repetitive phrasing and do not recite individual city forecasts.
 
-    Do not list cities one by one. Instead, compare regions and identify the
-    overall weather pattern across New Mexico.
+Use ONLY facts supported by the NWS discussions and point forecasts below.
+Some EPZ and MAF discussions also refer to Texas: EXCLUDE Texas weather,
+including Texas-only hazards. Do not conflate different forecast periods,
+misstate highs as lows, invent rainfall amounts, or invent weather systems.
+If some offices are unavailable, do not infer their missing conditions.
 
-    Do not confuse highs with low temperatures.
-    
-    Be sure to use complete sentences.
-    
-    Write one short paragraph of approximately 50 to 75 words.
+NWS AREA FORECAST DISCUSSIONS (some sections are excerpts):
+{afd_highlights or 'No Area Forecast Discussions available.'}
 
-    This forecast will be read live on radio, so prioritize only the
-    most important weather information.
-    
-    Focus on:
-    - the dominant statewide weather pattern
-    - the areas most affected
-    - significant hazards
-    - major temperature differences
-    
-    Do not repeat similar weather conditions for multiple regions.
-    Do not list individual city forecasts.
-    Do not include minor details when a broader regional description
-    will communicate the same information.
-    Use short, natural sentences that are easy to read aloud.
-
-    Discuss when relevant and significantly more detailed:
-    - temperature differences
-    - thunderstorm coverage and timing
-    - areas with the highest precipitation chances
-    - wind
-    - significant changes tonight or tomorrow
-    - hazards mentioned by the National Weather Service
-
-    Use varied conversational language suitable for a radio announcer.
-    Avoid repeatedly saying "expect", "look for", or "there is a chance".
-    Do not invent weather conditions that are not supported by the data.
-    Do not include headings or bullet points.
-    Never state rainfall amounts unless an amount is explicitly
-    provided in the source information.
-    
-    Do not infer overnight low temperatures from daytime forecasts.
-    
-    Be geographically accurate when describing New Mexico regions.
-    
-    Do not describe a weather system, such as high pressure or
-    low pressure, unless it is explicitly mentioned in the
-    National Weather Service information.
-    
-    Prefer regional descriptions over listing individual cities.
-    Write one concise paragraph 100 words.
-    Do not include "WEATHER ALERT" section.
-    
-    NATIONAL WEATHER SERVICE KEY MESSAGES:
-    {facts}
-    
-    REPRESENTATIVE NEW MEXICO FORECASTS:
-    {statewide_data}
-    """
-
+REPRESENTATIVE NEW MEXICO POINT FORECASTS:
+{statewide_data or 'Point forecasts unavailable.'}
+"""
     try:
-        text = ask_ollama(prompt)
-
-        bad_phrases = [
-            "here is",
-            "facts provided",
-            "national weather service key messages",
-            "as an ai",
-            "i cannot",
-        ]
-
-        if len(text) < 60:
-            raise RuntimeError("Ollama response too short")
-
-        if any(p in text.lower() for p in bad_phrases):
-            raise RuntimeError("Ollama response not clean")
-
-        return text
-
+        result = ask_ollama(prompt).strip().strip('"')
+        if len(result.split()) < 35 or len(result.split()) > 95:
+            raise RuntimeError("Ollama statewide forecast length out of range")
+        if any(phrase in result.lower() for phrase in (
+            "as an ai", "here is the forecast", "nws area forecast discussions",
+            "representative new mexico point forecasts",
+        )):
+            raise RuntimeError("Ollama response contains instructions or headings")
+        return result
     except Exception as ex:
         print(f"Ollama rewrite skipped: {ex}")
-        return facts
+        # Provide useful sourced prose instead of a fabricated statewide outlook.
+        if afd_highlights:
+            first = afd_highlights.split("\n\n", 1)[0]
+            first = re.sub(r"^[^\n]*\n", "", first)
+            first = re.sub(r"^[A-Z /-]+:\s*", "", first)
+            cleaned = clean_afd_text(first)
+            sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+            selected = []
+            for sentence in sentences:
+                if len((" ".join(selected + [sentence])).split()) > 80:
+                    break
+                selected.append(sentence)
+            return " ".join(selected) if selected else " ".join(cleaned.split()[:80]).rstrip(",;:") + "."
+        return (
+            "A statewide narrative is temporarily unavailable. "
+            "See the metro and city forecasts below for local conditions."
+        )
+
 
 def get_statewide_forecast():
     try:
-        products = get_json(
-            "https://api.weather.gov/products/types/AFD/locations/ABQ"
-        )
-
-        latest_id = products["@graph"][0]["id"]
-        product = get_json(f"https://api.weather.gov/products/{latest_id}")
-        text = product["productText"]
-
-        # Remove the NWS header
-        updated = re.search(r"Updated at.*?\n", text, re.DOTALL)
-        if updated:
-            text = text[updated.end():]
-
-        # Capture wrapped key-message bullet blocks
-        bullet_blocks = re.findall(
-            r"^\s*-\s+(.*?)(?=\n\s*-\s+|\n&&|\n\.[A-Z]|\Z)",
-            text,
-            re.MULTILINE | re.DOTALL
-        )
-
-        messages = []
-
-        for b in bullet_blocks[:4]:
-            b = re.sub(r"\s+", " ", b).strip()
-            b = b.replace(" NM", " New Mexico")
-            b = b.replace("NM.", "New Mexico.")
-            b = b.replace("east central", "east-central")
-            messages.append(b)
-
-        if messages:
-            raw_forecast = " ".join(messages)
-            forecast = rewrite_statewide_with_ollama(raw_forecast)
-        else:
-            forecast = (
-                "Weather conditions will vary across New Mexico today. "
-                "See the local forecasts below for additional details."
-            )
-
-
+        afd_highlights = get_statewide_afd_highlights()
+        statewide_data = build_statewide_weather_data()
+        forecast = rewrite_statewide_with_ollama(afd_highlights, statewide_data)
         return "STATEWIDE FORECAST\n\n" + forecast
-
     except Exception as ex:
         print(f"Statewide forecast error: {ex}")
         return (
             "STATEWIDE FORECAST\n\n"
-            "Weather conditions will vary across New Mexico today."
+            "A statewide narrative is temporarily unavailable. "
+            "See the metro and city forecasts below for local conditions."
         )
 
 
-def get_metro_forecast():
-    periods = get_forecast_periods(35.0844, -106.6504)
+def is_afternoon_broadcast(now=None):
+    """3 PM local New Mexico time is the broadcast cutoff."""
+    return (now or datetime.now(TZ)).hour >= 15
 
-    lines = ["METRO FORECAST", ""]
 
-    for period in periods[:3]:
-        name = period["name"]
-        temp_label = "High" if period["isDaytime"] else "Low"
-        temp = period["temperature"]
-        wind = f"{period['windDirection']} {period['windSpeed']}"
-        rain = period.get("probabilityOfPrecipitation", {}).get("value")
+def get_broadcast_periods(lat, lon, now=None):
+    """Return [(Today, Tonight)] or [(Tonight, Tomorrow)] using NWS dates."""
+    now = now or datetime.now(TZ)
+    today = now.date()
+    periods = get_forecast_periods(lat, lon)
 
-        rain_text = ""
-        if rain is not None and rain > 0:
-            rain_text = f" Chance of precipitation {rain}%."
+    def find_period(day, daytime):
+        for period in periods:
+            start = parse_date(period["startTime"])
+            if start.tzinfo is None:
+                start = start.replace(tzinfo=TZ)
+            start = start.astimezone(TZ)
+            if start.date() == day and period.get("isDaytime") == daytime:
+                return period
+        return None
 
-        lines.append(
-            f"{name}: {period['shortForecast']}. "
-            f"{temp_label} {temp}°. "
-            f"Wind {wind}.{rain_text}"
-        )
+    from datetime import timedelta
+    tonight = find_period(today, False)
+    if is_afternoon_broadcast(now):
+        return [("Tonight", tonight),
+                ("Tomorrow", find_period(today + timedelta(days=1), True))]
+    return [("Today", find_period(today, True)), ("Tonight", tonight)]
 
-    lines.append("")
-    lines.append("METRO TEMPERATURES")
-    lines.append("")
-    lines.append(f"{'Area':<10} {'High/Low':>10} {'Current':>10}  Forecast")
-    lines.append("-" * 55)
 
-    for area, (lat, lon) in METRO_AREAS.items():
-        selected = pick_city_period(get_forecast_periods(lat, lon))
-        current = get_current_temp(lat, lon)
+def forecast_snapshot(now=None):
+    """Keep console and email consistent, and avoid redundant API calls."""
+    now = now or datetime.now(TZ)
+    metro = get_broadcast_periods(35.0844, -106.6504, now)
+    city_forecasts = []
+    current_temps = []
+    for city, (lat, lon) in LOCATIONS.items():
+        try:
+            selected = get_broadcast_periods(lat, lon, now)[0][1]
+        except Exception as ex:
+            print(f"Forecast retrieval error for {city}: {ex}")
+            selected = None
+        city_forecasts.append((city, selected))
+        try:
+            # NWS hourly forecast is an estimate, not a station observation.
+            temperature = get_current_temp(lat, lon)
+        except Exception as ex:
+            print(f"Current hourly temperature error for {city}: {ex}")
+            temperature = None
+        current_temps.append((city, temperature))
+    return metro, city_forecasts, current_temps
 
-        lines.append(
-            f"{area:<10}"
-            f"{str(selected['temperature']) + '°':>10}"
-            f"{str(current) + '°':>10}  "
-            f"{selected['shortForecast']}"
-        )
 
+def temp_display(value):
+    return f"{value}°" if value is not None else "N/A"
+
+
+def get_metro_forecast(metro_periods=None):
+    if metro_periods is None:
+        metro_periods = get_broadcast_periods(35.0844, -106.6504)
+    lines = ["ALBUQUERQUE METRO FORECAST", ""]
+    for name, period in metro_periods:
+        if not period:
+            lines.append(f"{name}: Forecast unavailable.")
+            continue
+        kind = "High" if period.get("isDaytime") else "Low"
+        condition = (period.get("shortForecast") or "Conditions unavailable").rstrip(".")
+        lines.append(f"{name}: {kind} {temp_display(period.get('temperature'))}, {condition}.")
     return "\n".join(lines)
+
 
 def get_sunrise_sunset():
     city = LocationInfo(
@@ -502,56 +474,56 @@ def get_sunrise_sunset():
 
     return f"Sunrise in Albuquerque is {sunrise}. Sunset is {sunset}."
 
-def get_city_table():
-    now = datetime.now(TZ)
-    label = "High" if now.hour < 15 else "Low"
-
-    lines = [
-        "CITY FORECAST",
-        "",
-        f"{'City':<14} {'Current':>8} {label:>8}  Forecast",
-        "-" * 52,
-    ]
-
-    for city, (lat, lon) in LOCATIONS.items():
-        p = pick_city_period(get_forecast_periods(lat, lon))
-        current = get_current_temp(lat, lon)
-
-        lines.append(
-            f"{city:<14} "
-            f"{str(current) + '°':>8} "
-            f"{str(p.get('temperature')) + '°':>8}  "
-            f"{p.get('shortForecast', '')}"
-        )
-
+def get_city_table(city_forecasts=None, now=None):
+    now = now or datetime.now(TZ)
+    if city_forecasts is None:
+        _, city_forecasts, _ = forecast_snapshot(now)
+    daytime = not is_afternoon_broadcast(now)
+    label = "High" if daytime else "Low"
+    lines = [f"CITY {label.upper()} TEMPERATURES", "",
+             f"{'City':<16} {label:>6}  Conditions", "-" * 55]
+    for city, period in city_forecasts:
+        value = temp_display(period.get('temperature')) if period else "N/A"
+        conditions = (period.get('shortForecast') or 'Unavailable') if period else 'Forecast unavailable'
+        lines.append(f"{city:<16} {value:>6}  {conditions}")
     return "\n".join(lines)
+
+
+def get_current_temperatures(current_temps=None):
+    if current_temps is None:
+        _, _, current_temps = forecast_snapshot()
+    lines = ["CURRENT TEMPERATURES", "",
+             f"{'City':<16} {'Current':>8}", "-" * 28]
+    for city, temperature in current_temps:
+        lines.append(f"{city:<16} {temp_display(temperature):>8}")
+    return "\n".join(lines)
+
 
 def get_closing():
     return random.choice(CLOSINGS)
 
-def build_weather_email(
-    statewide,
-    alerts,
-    metro,
-    city_table,
-    sun,
-    closing
-):
+def get_report_datestamp():
+    """Timestamp in New Mexico local time, at report creation."""
+    now = datetime.now(TZ)
+    return f"{now.strftime('%A, %B')} {now.day}, {now.year} at {now.strftime('%I:%M %p').lstrip('0')} {now.strftime('%Z')}"
+
+
+def build_weather_email(statewide, alerts, metro, city_table,
+                        current_temps, sun, closing, datestamp=None):
+    datestamp = datestamp or get_report_datestamp()
     alert_section = ""
-
     if alerts:
-        alert_section = "WEATHER ALERTS\n\n"
+        alert_section = "WEATHER ALERTS\n\n" + "\n".join(alerts) + "\n\n"
+    return f"""KANW NEW MEXICO WEATHER
+Issued: {datestamp}
 
-        for alert in alerts:
-            alert_section += f"{alert}\n"
-
-        alert_section += "\n"
-
-    return f"""{statewide}
+{statewide}
 
 {alert_section}{metro}
 
 {city_table}
+
+{current_temps}
 
 SUNRISE / SUNSET
 
@@ -559,43 +531,6 @@ SUNRISE / SUNSET
 
 {closing}
 """
-
-def build_metro_rows_html():
-    rows = ""
-
-    for area, (lat, lon) in METRO_AREAS.items():
-        current = get_current_temp(lat, lon)
-        p = pick_city_period(get_forecast_periods(lat, lon))
-
-        rows += f"""
-        <tr>
-            <td style="padding:8px;border-bottom:1px solid #ddd;">{area}</td>
-            <td style="padding:8px;text-align:center;border-bottom:1px solid #ddd;font-weight:bold;">{p.get('temperature')}°</td>
-            <td style="padding:8px;text-align:center;border-bottom:1px solid #ddd;font-weight:bold;">{current}°</td>
-            <td style="padding:8px;border-bottom:1px solid #ddd;">{p.get('shortForecast', '')}</td>
-        </tr>
-        """
-
-    return rows
-
-
-def build_city_rows_html():
-    rows = ""
-
-    for city, (lat, lon) in LOCATIONS.items():
-        current = get_current_temp(lat, lon)
-        p = pick_city_period(get_forecast_periods(lat, lon))
-
-        rows += f"""
-        <tr>
-            <td style="padding:8px;border-bottom:1px solid #ddd;">{city}</td>
-            <td style="padding:8px;text-align:center;border-bottom:1px solid #ddd;font-weight:bold;">{current}°</td>
-            <td style="padding:8px;text-align:center;border-bottom:1px solid #ddd;font-weight:bold;">{p.get('temperature')}°</td>
-            <td style="padding:8px;border-bottom:1px solid #ddd;">{p.get('shortForecast', '')}</td>
-        </tr>
-        """
-
-    return rows
 
 
 def build_statewide_weather_data():
@@ -653,131 +588,82 @@ def build_statewide_weather_data():
     return "\n".join(lines)
 
 
-def build_weather_email_html(statewide, alerts, metro, sun, closing):
+def build_weather_email_html(statewide, alerts, metro, city_forecasts,
+                             current_temps, sun, closing, datestamp=None,
+                             afternoon=None):
+    datestamp = datestamp or get_report_datestamp()
+    if afternoon is None:
+        afternoon = is_afternoon_broadcast()
 
-    statewide_html = statewide.replace("STATEWIDE FORECAST", "").strip()
-    closing_html = closing.replace("\n", "<br>")
+    def safe(value):
+        return html.escape(str(value)).replace("°", "&#176;")
 
-    metro_html = ""
-    current_period = None
+    statewide_text = statewide.replace("STATEWIDE FORECAST", "", 1).strip()
+    metro_text = metro.replace("ALBUQUERQUE METRO FORECAST", "", 1).strip()
+    metro_html = "".join(
+        f"<p style='margin:8px 0'>{safe(line)}</p>"
+        for line in metro_text.splitlines() if line.strip()
+    )
+    label = "Low" if afternoon else "High"
+    forecast_rows = ""
+    for city, period in city_forecasts:
+        temperature = temp_display(period.get('temperature')) if period else "N/A"
+        condition = (period.get('shortForecast') or 'Unavailable') if period else 'Forecast unavailable'
+        forecast_rows += ("<tr>"
+                          f"<td>{safe(city)}</td>"
+                          f"<td class='numeric'>{safe(temperature)}</td>"
+                          f"<td>{safe(condition)}</td></tr>")
 
-    for line in metro.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        if line in ["Today", "Tonight", "Tomorrow", "Tomorrow Night"]:
-            current_period = line
-            metro_html += f"<h3 style='color:#333;margin-top:16px;'>{line}</h3>"
-            continue
-
-        if line.startswith("METRO"):
-            continue
-
-        if line.startswith("High:") or line.startswith("Low:"):
-            metro_html += f"<p><strong>{line}</strong></p>"
-        elif line.startswith("Wind:") or line.startswith("Humidity:") or line.startswith("Chance of precipitation:"):
-            label, text = line.split(":", 1)
-            metro_html += f"<p><strong>{label}:</strong> {text.strip()}</p>"
-        elif not line.startswith("Area") and not line.startswith("-") and not line.startswith("Valley") and not line.startswith("Heights"):
-            metro_html += f"<p>{line}</p>"
+    current_rows = "".join(
+        f"<tr><td>{safe(city)}</td><td class='numeric'>{safe(temp_display(value))}</td></tr>"
+        for city, value in current_temps
+    )
     alerts_html = ""
-
     if alerts:
-        alert_items = ""
+        items = "".join(f"<li>{safe(alert)}</li>" for alert in alerts)
+        alerts_html = ("<section class='alerts'><h2>Weather Alerts</h2>"
+                       f"<ul>{items}</ul></section>")
 
-        for alert in alerts:
-            alert_items += f"<li style='margin-bottom:6px;'>{alert}</li>"
-
-        alerts_html = f"""
-        <div style="
-            margin:20px 0;
-            padding:15px;
-            background:#fff3cd;
-            border:1px solid #ffe69c;
-        ">
-            <h2 style="margin-top:0;">Weather Alerts</h2>
-            <ul style="margin-bottom:0;">
-                {alert_items}
-            </ul>
-        </div>
-        """
-    return f"""
-<!DOCTYPE html>
-<html>
-<body style="margin:0;padding:0;background:#f4f4f4;font-family:Arial,Helvetica,sans-serif;color:#222;">
-<div style="max-width:760px;margin:0 auto;background:#fff;padding:24px;">
-
-<div style="border-bottom:4px solid #1f5f99;padding-bottom:12px;margin-bottom:22px;">
-<h1 style="margin:0;color:#1f5f99;">KANW New Mexico Weather</h1>
-<p style="margin-top:6px;color:#666;">
-Automated weather briefing for 89.1 KANW FM
-</p>
-</div>
-
-<h2 style="color:#1f5f99;">Statewide Forecast</h2>
-
-<p>{statewide_html}</p>
-
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KANW New Mexico Weather</title>
+<style>
+body {{font-family:Arial,Helvetica,sans-serif;color:#222;background:#f4f4f4;margin:0;padding:16px;}}
+.container {{max-width:760px;margin:auto;background:white;padding:24px;}}
+h1,h2 {{color:#1f5f99;}}
+h1 {{margin-bottom:5px;}}
+h2 {{margin-top:24px;}}
+.datestamp {{font-size:14px;color:#666;font-weight:normal;margin:5px 0 22px;}}
+table {{width:100%;border-collapse:collapse;margin-bottom:24px;}}
+th {{background:#1f5f99;color:white;padding:9px;text-align:left;}}
+td {{padding:9px;border-bottom:1px solid #ddd;}}
+.numeric {{text-align:center;white-space:nowrap;}}
+.alerts {{background:#fff3cd;border:1px solid #ffe69c;padding:8px 14px;}}
+.footer {{margin-top:25px;border-top:1px solid #ccc;padding-top:15px;}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>KANW New Mexico Weather</h1>
+<p class="datestamp">Issued: {safe(datestamp)}</p>
+<h2>Statewide Forecast</h2>
+<p>{safe(statewide_text)}</p>
 {alerts_html}
-
-<h2 style="color:#1f5f99;">Metro Forecast</h2>
-
+<h2>Albuquerque Metro Forecast</h2>
 {metro_html}
-
-<h3>Metro Temperatures</h3>
-
-<table style="width:100%;border-collapse:collapse;">
-<thead>
-<tr style="background:#1f5f99;color:white;">
-<th>Area</th>
-<th>High/Low</th>
-<th>Current</th>
-<th>Forecast</th>
-</tr>
-</thead>
-
-<tbody>
-
-{build_metro_rows_html()}
-
-</tbody>
-
-</table>
-
-<h2 style="color:#1f5f99;">City Forecast</h2>
-
-<table style="width:100%;border-collapse:collapse;">
-<thead>
-<tr style="background:#1f5f99;color:white;">
-<th>City</th>
-<th>Current</th>
-<th>High/Low</th>
-<th>Forecast</th>
-</tr>
-</thead>
-
-<tbody>
-
-{build_city_rows_html()}
-
-</tbody>
-
-</table>
-
-<h2 style="color:#1f5f99;">Sunrise / Sunset</h2>
-
-<p>{sun}</p>
-
-<p style="margin-top:25px;border-top:1px solid #ccc;padding-top:15px;">
-{closing_html}
-</p>
-
-</div>
-</body>
-</html>
-"""
+<h2>City {label} Temperatures</h2>
+<table><thead><tr><th>City</th><th>{label}</th><th>Conditions</th></tr></thead>
+<tbody>{forecast_rows}</tbody></table>
+<h2>Current Temperatures</h2>
+<table><thead><tr><th>City</th><th>Current</th></tr></thead>
+<tbody>{current_rows}</tbody></table>
+<h2>Sunrise / Sunset</h2>
+<p>{safe(sun)}</p>
+<p class="footer">{safe(closing)}</p>
+</div></body></html>"""
 
 
 def send_email(subject, text_body, html_body=None, to_email=None):
@@ -946,28 +832,25 @@ def main():
             print("No active NM Music calendar event.")
             return
 
+    report_now = datetime.now(TZ)
     statewide = get_statewide_forecast()
-    metro = get_metro_forecast()
-    city_table = get_city_table()
+    metro_periods, city_forecasts, current_values = forecast_snapshot(report_now)
+    metro = get_metro_forecast(metro_periods)
+    city_table = get_city_table(city_forecasts, report_now)
+    current_temps = get_current_temperatures(current_values)
     sun = get_sunrise_sunset()
     closing = get_closing()
     alerts = get_nm_alerts()
+    datestamp = get_report_datestamp()
 
     text_message = build_weather_email(
-        statewide,
-        alerts,
-        metro,
-        city_table,
-        sun,
-        closing,
+        statewide, alerts, metro, city_table, current_temps,
+        sun, closing, datestamp,
     )
 
     html_message = build_weather_email_html(
-        statewide,
-        alerts,
-        metro,
-        sun,
-        closing,
+        statewide, alerts, metro, city_forecasts, current_values,
+        sun, closing, datestamp, is_afternoon_broadcast(report_now),
     )
 
     if args.preview:
